@@ -12,15 +12,41 @@ from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-_BLOCK_K = 1024
 _BLOCK_D = 1024
 
 # post-specific tile: the post kernel handles all hc channels of one BLOCK_D
 # hidden slice as a single [HC_POW2, BLOCK_D] tile, which prefers a narrower
-# tile than the pre stage2 reduction above. Measured best at every token count
-# on H20 (D=6144/4096, hc=4, fp16/bf16); see _ihc_post_kernel.
+# tile than the pre stage2 reduction. Measured best at every token count on H20
+# (D=6144/4096, hc=4, fp16/bf16); see _ihc_post_kernel.
 _POST_BLOCK_D = 512
 _POST_NUM_WARPS = 4
+
+# pre stage1 (w-projection + sqrsum) tiling.
+_BLOCK_K = 128
+_BLOCK_M = 8
+_PRE_STAGE1_WARPS = 1
+_PRE_NUM_STAGES = 3
+# Only K-split stage1 when the token-blocks alone cannot fill the GPU.
+_MIN_PROGRAMS = 512
+
+# Token count below which the decode-shaped pre path is used. The M-blocked
+# stage1 amortizes the weight rows across BLOCK_M tokens, which only pays off
+# once there are enough token-blocks to fill the GPU; below that it starves
+# (measured up to 2.5x slower at a single token). The decode path instead splits
+# K finely, loads the 2*hc weight rows as one 2D tile, and folds the partial
+# reduction into stage2 so the whole op costs two kernel launches instead of
+# three -- at decode sizes a launch is ~4.5us, i.e. 20-40% of the total.
+_DECODE_N_THRESHOLD = 256
+# BLOCK_K for the decode stage1, by token count: tiny batches need K cut finely
+# to expose enough programs, larger ones prefer fewer, wider chunks.
+_DECODE_BLOCK_K = ((2, 128), (16, 256), (64, 512), (None, 1024))
+
+
+def _decode_block_k(num_tokens: int) -> int:
+    for limit, block_k in _DECODE_BLOCK_K:
+        if limit is None or num_tokens < limit:
+            return block_k
+    return _DECODE_BLOCK_K[-1][1]
 
 
 def triton_ihc_supported(x: torch.Tensor) -> bool:
@@ -38,87 +64,190 @@ def triton_ihc_supported(x: torch.Tensor) -> bool:
 def _ihc_pre_stage1(
     x_ptr,
     weight_ptr,
+    sumsq_slot_ptr,
+    mix_slot_ptr,
+    N,
+    X_STRIDE: tl.constexpr,
+    K_CHUNK: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """fp32 w-projection mix[N, 2*hc] and row sqrsum[N], for prefill shapes.
+
+    One program owns BLOCK_M tokens; x is loaded once per K-chunk and reused for
+    sqrsum plus all 2*hc weight-row FMAs (register-resident), removing the eager
+    2*hc-fold L1 re-read of x -- the measured L1TEX bottleneck. The K loop uses
+    tl.range software pipelining (num_stages) to prefetch the next x chunk.
+    fp32 accumulation keeps the post gate accurate; tl.dot in bf16/tf32 would
+    blow the 2e-5 gate tolerance at K = hc*hidden.
+
+    One grid axis for the token blocks, one (NSPLIT-wide) for a K-split that
+    kicks in when the token-blocks alone cannot fill the GPU. Every program
+    writes its own (split, token) slot and stage2 sums the slots in index order,
+    so the reduction order is fixed no matter how the blocks interleave -- the
+    result does not depend on which block arrives first.
+
+    X_STRIDE is the full row length and K_CHUNK is this program's share of it.
+    They have to be separate: deriving the row stride from the reduction length
+    would stop a program from covering part of K while still addressing whole
+    rows.
+    """
+    token_block_idx = tl.program_id(0).to(tl.int64)
+    split_idx = tl.program_id(1)
+
+    m_off = token_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_off < N
+
+    k_start = split_idx * K_CHUNK
+
+    # One accumulator per projection row, plus one for the row sqrsum. Triton
+    # has no mutable list, so the running values are carried in a tuple that is
+    # rebuilt each iteration.
+    sum_squares = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    mixes = ()
+    for _ in tl.static_range(TWO_HC):
+        mixes = mixes + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
+
+    x_base = x_ptr + m_off[:, None] * X_STRIDE
+    for k_offset in tl.range(0, K_CHUNK, BLOCK_K, num_stages=NUM_STAGES):
+        k_off = k_start + k_offset + tl.arange(0, BLOCK_K)
+        k_mask = k_off < X_STRIDE
+
+        x = tl.load(
+            x_base + k_off[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        sum_squares += tl.sum(x * x, axis=1)
+
+        # Reuse the x tile just loaded for every projection row.
+        next_mixes = ()
+        for j in tl.static_range(TWO_HC):
+            weight_row = tl.load(
+                weight_ptr + j * X_STRIDE + k_off, mask=k_mask, other=0.0
+            )
+            contribution = tl.sum(x * weight_row[None, :], axis=1)
+            next_mixes = next_mixes + (mixes[j] + contribution,)
+        mixes = next_mixes
+
+    # Private slot per (split, token): a plain store either way, so NSPLIT == 1
+    # needs no special case.
+    tl.store(sumsq_slot_ptr + split_idx * N + m_off, sum_squares, mask=m_mask)
+    mix_slot = mix_slot_ptr + split_idx * N * TWO_HC + m_off * TWO_HC
+    for j in tl.static_range(TWO_HC):
+        tl.store(mix_slot + j, mixes[j], mask=m_mask)
+
+
+@triton.jit
+def _ihc_pre_stage1_decode(
+    x_ptr,
+    weight_ptr,
     partial_ptr,
     K_TOTAL: tl.constexpr,
-    HC_MULT: tl.constexpr,
-    HC_POW2: tl.constexpr,
+    TWO_HC: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PARTIAL_STRIDE: tl.constexpr,
 ):
+    """Decode-shaped stage1: one program per (token, K-chunk).
+
+    With few tokens there is no weight reuse to win, so the goal is simply to
+    expose enough programs and keep each one cheap. The 2*hc weight rows are
+    fetched as a single [2*hc, BLOCK_K] tile and reduced along K in one
+    vectorized step, rather than looping the rows one at a time. Each program
+    owns one partial slot, so no atomics are needed;
+    _ihc_pre_stage2_decode folds the slot reduction in.
+    """
     token_idx = tl.program_id(0).to(tl.int64)
     split_idx = tl.program_id(1)
-    hc_idx = tl.arange(0, HC_POW2)
-    hc_mask = hc_idx < HC_MULT
+    k_off = split_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_off < K_TOTAL
 
-    k_offsets = split_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-    k_mask = k_offsets < K_TOTAL
     x = tl.load(
-        x_ptr + token_idx * K_TOTAL + k_offsets,
+        x_ptr + token_idx * K_TOTAL + k_off,
         mask=k_mask,
         other=0.0,
     ).to(tl.float32)
+
     sum_squares = tl.sum(x * x, axis=0)
 
-    weight_offsets = hc_idx[:, None] * K_TOTAL + k_offsets[None, :]
-    weight_mask = hc_mask[:, None] & k_mask[None, :]
-    pre_mix = tl.sum(
-        tl.load(weight_ptr + weight_offsets, mask=weight_mask, other=0.0) * x[None, :],
-        axis=1,
+    # All 2*hc weight rows as one tile, so the projection is a single reduction
+    # along K instead of one pass per row.
+    mix_idx = tl.arange(0, TWO_HC)
+    weight = tl.load(
+        weight_ptr + mix_idx[:, None] * K_TOTAL + k_off[None, :],
+        mask=k_mask[None, :],
+        other=0.0,
     )
-    post_mix = tl.sum(
-        tl.load(
-            weight_ptr + HC_MULT * K_TOTAL + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        )
-        * x[None, :],
-        axis=1,
-    )
+    mixes = tl.sum(weight * x[None, :], axis=1)
 
     partial = partial_ptr + (token_idx * NUM_SPLITS + split_idx) * PARTIAL_STRIDE
     tl.store(partial, sum_squares)
-    tl.store(partial + 1 + hc_idx, pre_mix, mask=hc_mask)
-    tl.store(partial + 1 + HC_POW2 + hc_idx, post_mix, mask=hc_mask)
+    tl.store(partial + 1 + mix_idx, mixes)
 
 
 @triton.jit
 def _ihc_pre_stage2(
     x_ptr,
-    partial_ptr,
+    mix_slot_ptr,
+    sumsq_slot_ptr,
     scale_ptr,
     base_ptr,
     output_ptr,
     post_ptr,
+    N,
     HIDDEN_SIZE: tl.constexpr,
     K_TOTAL: tl.constexpr,
     HC_MULT: tl.constexpr,
     HC_POW2: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-    PARTIAL_STRIDE: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
     MAGNITUDE: tl.constexpr,
     NORM_EPS: tl.constexpr,
     HC_EPS: tl.constexpr,
 ):
+    """Reduce the per-split slots, form the gates, emit the channel sum.
+
+    Folding the slot reduction in here keeps the op at two launches; a separate
+    reduction kernel would add a third. The sum runs over the split axis in
+    index order, which is what makes the result independent of block completion
+    order.
+    """
     token_idx = tl.program_id(0).to(tl.int64)
     hidden_block_idx = tl.program_id(1)
     hc_idx = tl.arange(0, HC_POW2)
     hc_mask = hc_idx < HC_MULT
 
-    partial_row = partial_ptr + token_idx * NUM_SPLITS * PARTIAL_STRIDE
-    sum_squares = tl.zeros((), dtype=tl.float32)
-    pre_mix = tl.zeros((HC_POW2,), dtype=tl.float32)
-    post_mix = tl.zeros((HC_POW2,), dtype=tl.float32)
-    for split_idx in tl.static_range(NUM_SPLITS):
-        partial = partial_row + split_idx * PARTIAL_STRIDE
-        sum_squares += tl.load(partial)
-        pre_mix += tl.load(partial + 1 + hc_idx, mask=hc_mask, other=0.0)
-        post_mix += tl.load(
-            partial + 1 + HC_POW2 + hc_idx,
-            mask=hc_mask,
-            other=0.0,
-        )
+    split_idx = tl.arange(0, BLOCK_S)
+    split_mask = split_idx < NSPLIT
+
+    sum_squares = tl.sum(
+        tl.load(sumsq_slot_ptr + split_idx * N + token_idx, mask=split_mask, other=0.0),
+        axis=0,
+    )
+
+    mix_idx = tl.arange(0, TWO_HC)
+    mix_parts = tl.load(
+        mix_slot_ptr
+        + split_idx[:, None] * N * TWO_HC
+        + token_idx * TWO_HC
+        + mix_idx[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    mixes = tl.sum(mix_parts, axis=0)
+
+    # Split the reduced row into the pre gates' logits and the post gates'.
+    is_pre = mix_idx[None, :] == hc_idx[:, None]
+    is_post = mix_idx[None, :] == (hc_idx[:, None] + HC_MULT)
+    pre_mix = tl.sum(tl.where(is_pre, mixes[None, :], 0.0), axis=1)
+    post_mix = tl.sum(tl.where(is_post, mixes[None, :], 0.0), axis=1)
 
     reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
     pre_scale = tl.load(scale_ptr)
@@ -137,6 +266,94 @@ def _ihc_pre_stage2(
             post,
             mask=hc_mask,
         )
+
+    hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    hidden_mask = hidden_offsets < HIDDEN_SIZE
+    x_row = x_ptr + token_idx * K_TOTAL
+    output = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for channel_idx in tl.static_range(HC_MULT):
+        channel = tl.load(
+            x_row + channel_idx * HIDDEN_SIZE + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        channel_gate = tl.sum(tl.where(hc_idx == channel_idx, pre, 0.0), axis=0)
+        output += channel_gate * channel
+
+    tl.store(
+        output_ptr + token_idx * HIDDEN_SIZE + hidden_offsets,
+        output.to(output_ptr.dtype.element_ty),
+        mask=hidden_mask,
+    )
+
+
+@triton.jit
+def _ihc_pre_stage2_decode(
+    x_ptr,
+    partial_ptr,
+    scale_ptr,
+    base_ptr,
+    output_ptr,
+    post_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    K_TOTAL: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    HC_POW2: tl.constexpr,
+    TWO_HC: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    PARTIAL_STRIDE: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    MAGNITUDE: tl.constexpr,
+    NORM_EPS: tl.constexpr,
+    HC_EPS: tl.constexpr,
+):
+    """Decode stage2: same gating and channel sum, reducing its own slots.
+
+    Reduces the partial slots written by _ihc_pre_stage1_decode instead of
+    reading a pre-reduced mix / sqrsum, which keeps the decode path at two
+    kernel launches; a separate reduction kernel would add a third, costing
+    ~4.5us -- a large fraction of the total at these sizes.
+    """
+    token_idx = tl.program_id(0).to(tl.int64)
+    hidden_block_idx = tl.program_id(1)
+    hc_idx = tl.arange(0, HC_POW2)
+    hc_mask = hc_idx < HC_MULT
+
+    split_idx = tl.arange(0, BLOCK_S)
+    split_mask = split_idx < NUM_SPLITS
+    partial_row = partial_ptr + token_idx * NUM_SPLITS * PARTIAL_STRIDE
+    slot_ptrs = partial_row + split_idx * PARTIAL_STRIDE
+
+    # Slot layout is [sqrsum, mix[0 .. 2*hc-1]]; reduce over the split axis.
+    sqrsum_parts = tl.load(slot_ptrs, mask=split_mask, other=0.0)
+    sum_squares = tl.sum(sqrsum_parts, axis=0)
+
+    mix_idx = tl.arange(0, TWO_HC)
+    mix_ptrs = slot_ptrs[:, None] + 1 + mix_idx[None, :]
+    mix_parts = tl.load(mix_ptrs, mask=split_mask[:, None], other=0.0)
+    mixes = tl.sum(mix_parts, axis=0)
+
+    # Split the reduced row into the pre gates' logits (first hc entries) and
+    # the post gates' (next hc).
+    is_pre = mix_idx[None, :] == hc_idx[:, None]
+    is_post = mix_idx[None, :] == (hc_idx[:, None] + HC_MULT)
+    pre_mix = tl.sum(tl.where(is_pre, mixes[None, :], 0.0), axis=1)
+    post_mix = tl.sum(tl.where(is_post, mixes[None, :], 0.0), axis=1)
+
+    reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
+    pre_scale = tl.load(scale_ptr)
+    post_scale = tl.load(scale_ptr + 1)
+    pre_base = tl.load(base_ptr + hc_idx, mask=hc_mask, other=0.0)
+    post_base = tl.load(base_ptr + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+    pre = tl.sigmoid(pre_mix * reciprocal_rms * pre_scale + pre_base) + HC_EPS
+
+    if hidden_block_idx == 0:
+        post = (
+            MAGNITUDE * tl.sigmoid(post_mix * reciprocal_rms * post_scale + post_base)
+            + HC_EPS
+        )
+        tl.store(post_ptr + token_idx * HC_MULT + hc_idx, post, mask=hc_mask)
 
     hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
     hidden_mask = hidden_offsets < HIDDEN_SIZE
@@ -255,40 +472,109 @@ def triton_ihc_pre(
     output = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=x.device)
     post = torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=x.device)
     hc_pow2 = triton.next_power_of_2(hc_mult)
-    num_splits = triton.cdiv(k_total, _BLOCK_K)
-    partial_stride = 1 + 2 * hc_pow2
-    partial = torch.empty(
-        (num_tokens, num_splits, partial_stride),
-        dtype=torch.float32,
-        device=x.device,
-    )
+    two_hc = 2 * hc_mult
+    x_flat = x.reshape(num_tokens, k_total)
 
-    _ihc_pre_stage1[(num_tokens, num_splits)](
-        x,
+    if num_tokens < _DECODE_N_THRESHOLD:
+        # Decode shapes: fine K-split + fused reduction, two launches total.
+        block_k = _decode_block_k(num_tokens)
+        num_splits = triton.cdiv(k_total, block_k)
+        partial_stride = 1 + two_hc
+        partial = torch.empty(
+            (num_tokens, num_splits, partial_stride),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        _ihc_pre_stage1_decode[(num_tokens, num_splits)](
+            x_flat,
+            weight,
+            partial,
+            K_TOTAL=k_total,
+            TWO_HC=two_hc,
+            NUM_SPLITS=num_splits,
+            BLOCK_K=block_k,
+            PARTIAL_STRIDE=partial_stride,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        _ihc_pre_stage2_decode[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
+            x,
+            partial,
+            scale,
+            base,
+            output,
+            post,
+            HIDDEN_SIZE=hidden_size,
+            K_TOTAL=k_total,
+            HC_MULT=hc_mult,
+            HC_POW2=hc_pow2,
+            TWO_HC=two_hc,
+            NUM_SPLITS=num_splits,
+            PARTIAL_STRIDE=partial_stride,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            BLOCK_D=_BLOCK_D,
+            MAGNITUDE=magnitude,
+            NORM_EPS=norm_eps,
+            HC_EPS=hc_eps,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return output, post
+
+    # Prefill shapes: M-blocked stage1 writing fp32 mix / sqrsum slots, one per
+    # (split, token). K-split only when token-blocks alone cannot fill the GPU;
+    # otherwise the single-pass M-block grid already has enough programs and
+    # splitting just adds slots to reduce.
+    #
+    # The split is not merely about program count: it also shortens each
+    # program's serial K chain (24576 -> 1536 at NSPLIT=16). Lowering BLOCK_M
+    # raises the program count too but leaves that chain intact, and measures
+    # 2.3x slower at 256 tokens even with 256 programs on 78 SMs.
+    grid_m = triton.cdiv(num_tokens, _BLOCK_M)
+    nsplit = 1
+    while (
+        grid_m * nsplit * 2 <= _MIN_PROGRAMS and k_total % (nsplit * 2 * _BLOCK_K) == 0
+    ):
+        nsplit *= 2
+
+    # One slot per (split, token); stage2 reduces them. torch.empty is enough
+    # because nothing accumulates into these.
+    sumsq = torch.empty(nsplit * num_tokens, dtype=torch.float32, device=x.device)
+    mix = torch.empty(
+        nsplit * num_tokens * two_hc, dtype=torch.float32, device=x.device
+    )
+    _ihc_pre_stage1[(grid_m, nsplit)](
+        x_flat,
         weight,
-        partial,
-        K_TOTAL=k_total,
-        HC_MULT=hc_mult,
-        HC_POW2=hc_pow2,
-        NUM_SPLITS=num_splits,
+        sumsq,
+        mix,
+        num_tokens,
+        X_STRIDE=k_total,
+        K_CHUNK=k_total // nsplit,
+        TWO_HC=two_hc,
+        BLOCK_M=_BLOCK_M,
         BLOCK_K=_BLOCK_K,
-        PARTIAL_STRIDE=partial_stride,
-        num_warps=8,
+        NSPLIT=nsplit,
+        NUM_STAGES=_PRE_NUM_STAGES,
+        num_warps=_PRE_STAGE1_WARPS,
         enable_fp_fusion=False,
     )
     _ihc_pre_stage2[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
         x,
-        partial,
+        mix,
+        sumsq,
         scale,
         base,
         output,
         post,
+        num_tokens,
         HIDDEN_SIZE=hidden_size,
         K_TOTAL=k_total,
         HC_MULT=hc_mult,
         HC_POW2=hc_pow2,
-        NUM_SPLITS=num_splits,
-        PARTIAL_STRIDE=partial_stride,
+        TWO_HC=two_hc,
+        NSPLIT=nsplit,
+        BLOCK_S=triton.next_power_of_2(nsplit),
         BLOCK_D=_BLOCK_D,
         MAGNITUDE=magnitude,
         NORM_EPS=norm_eps,
