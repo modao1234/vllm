@@ -109,7 +109,7 @@ def _ihc_pre_stage1(
     sum_squares = tl.zeros((BLOCK_M,), dtype=tl.float32)
     mixes = ()
     for _ in tl.static_range(TWO_HC):
-        mixes = mixes + (tl.zeros((BLOCK_M,), dtype=tl.float32),)
+        mixes += (tl.zeros((BLOCK_M,), dtype=tl.float32),)  # type: ignore[assignment]
 
     x_base = x_ptr + m_off[:, None] * X_STRIDE
     for k_offset in tl.range(0, K_CHUNK, BLOCK_K, num_stages=NUM_STAGES):
@@ -131,7 +131,7 @@ def _ihc_pre_stage1(
                 weight_ptr + j * X_STRIDE + k_off, mask=k_mask, other=0.0
             )
             contribution = tl.sum(x * weight_row[None, :], axis=1)
-            next_mixes = next_mixes + (mixes[j] + contribution,)
+            next_mixes += (mixes[j] + contribution,)  # type: ignore[assignment]
         mixes = next_mixes
 
     # Private slot per (split, token): a plain store either way, so NSPLIT == 1
