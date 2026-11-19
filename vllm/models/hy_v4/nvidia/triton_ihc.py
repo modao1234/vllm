@@ -9,6 +9,7 @@ https://github.com/sgl-project/sglang/pull/36805
 import torch
 
 from vllm import envs
+from vllm.models.hy_v4.nvidia.triton_ihc_pre_h100 import h100_ihc_pre, is_h100
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -226,6 +227,14 @@ def triton_ihc_pre(
             torch.empty((0, hidden_size), dtype=x.dtype, device=x.device),
             torch.empty((0, hc_mult), dtype=torch.float32, device=x.device),
         )
+
+    if (
+        hc_mult == 4
+        and hidden_size == 3072
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and is_h100(x.device.index)
+    ):
+        return h100_ihc_pre(x, weight, scale, base, magnitude, hc_eps, norm_eps)
 
     output = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=x.device)
     post = torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=x.device)
